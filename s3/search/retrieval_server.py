@@ -5,6 +5,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))  
 sys.path.insert(0, project_root)  
 import utils.java_init
+from utils.embedding_client import APIEncoder
 
 import json
 import os
@@ -223,20 +224,40 @@ class DenseRetriever(BaseRetriever):
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
         self.corpus = load_corpus(self.corpus_path)
-        self.encoder = Encoder(
-            model_name = self.retrieval_method,
-            model_path = config.retrieval_model_path,
-            pooling_method = config.retrieval_pooling_method,
-            max_length = config.retrieval_query_max_length,
-            use_fp16 = config.retrieval_use_fp16
-        )
+        if getattr(config, "embedding_api_url", None):
+            self.encoder = APIEncoder(
+                api_url=config.embedding_api_url,
+                model_name=config.embedding_model_name,
+                batch_size=config.retrieval_batch_size,
+            )
+            print(
+                f"Using remote embedding API: {config.embedding_api_url} "
+                f"(model: {config.embedding_model_name})"
+            )
+        else:
+            self.encoder = Encoder(
+                model_name = self.retrieval_method,
+                model_path = config.retrieval_model_path,
+                pooling_method = config.retrieval_pooling_method,
+                max_length = config.retrieval_query_max_length,
+                use_fp16 = config.retrieval_use_fp16
+            )
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
+
+    def _validate_dim(self, query_emb):
+        if query_emb.shape[-1] != self.index.d:
+            raise RuntimeError(
+                f"Embedding dim {query_emb.shape[-1]} != faiss index dim {self.index.d}. "
+                f"The index was built with a different encoder; rebuild it with "
+                f"the current embedding model."
+            )
 
     def _search(self, query: str, num: int = None, return_score: bool = False):
         if num is None:
             num = self.topk
         query_emb = self.encoder.encode(query)
+        self._validate_dim(query_emb)
         scores, idxs = self.index.search(query_emb, k=num)
         idxs = idxs[0]
         scores = scores[0]
@@ -257,6 +278,7 @@ class DenseRetriever(BaseRetriever):
         for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc='Retrieval process: '):
             query_batch = query_list[start_idx:start_idx + self.batch_size]
             batch_emb = self.encoder.encode(query_batch)
+            self._validate_dim(batch_emb)
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
@@ -307,7 +329,9 @@ class Config:
         retrieval_pooling_method: str = "mean",
         retrieval_query_max_length: int = 256,
         retrieval_use_fp16: bool = False,
-        retrieval_batch_size: int = 128
+        retrieval_batch_size: int = 128,
+        embedding_api_url: str = "",
+        embedding_model_name: str = "bge-m3"
     ):
         self.retrieval_method = retrieval_method
         self.retrieval_topk = retrieval_topk
@@ -321,6 +345,8 @@ class Config:
         self.retrieval_query_max_length = retrieval_query_max_length
         self.retrieval_use_fp16 = retrieval_use_fp16
         self.retrieval_batch_size = retrieval_batch_size
+        self.embedding_api_url = embedding_api_url
+        self.embedding_model_name = embedding_model_name
 
 
 class QueryRequest(BaseModel):
@@ -376,6 +402,11 @@ if __name__ == "__main__":
     parser.add_argument("--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model.")
     parser.add_argument('--faiss_gpu', action='store_true', help='Use GPU for computation')
     parser.add_argument('--port', type=int, default=8000, help='Port to run the server on.')
+    parser.add_argument('--embedding_api_url', type=str, default='http://127.0.0.1:8091/v1/embeddings',
+                        help="OpenAI-compatible embedding API URL (e.g. vLLM serving bge-m3). "
+                             "Set to 'none' to use the local GPU encoder.")
+    parser.add_argument('--embedding_model_name', type=str, default='bge-m3',
+                        help='Model name accepted by the embedding API.')
 
     args = parser.parse_args()
     
@@ -392,6 +423,8 @@ if __name__ == "__main__":
         retrieval_query_max_length=256,
         retrieval_use_fp16=True,
         retrieval_batch_size=512,
+        embedding_api_url=None if args.embedding_api_url.lower() == 'none' else args.embedding_api_url,
+        embedding_model_name=args.embedding_model_name,
     )
     print("Config initialized")
     # 2) Instantiate a global retriever so it is loaded once and reused.

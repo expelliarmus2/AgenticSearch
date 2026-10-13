@@ -1,4 +1,11 @@
 import os
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(current_dir))
+sys.path.insert(0, project_root)
+from utils.embedding_client import APIEncoder
+
 import faiss
 import json
 import warnings
@@ -72,9 +79,11 @@ class Index_Builder:
             faiss_type=None,
             embedding_path=None,
             save_embedding=False,
-            faiss_gpu=False
+            faiss_gpu=False,
+            embedding_api_url=None,
+            embedding_model_name="bge-m3"
         ):
-        
+
         self.retrieval_method = retrieval_method.lower()
         self.model_path = model_path
         self.corpus_path = corpus_path
@@ -87,6 +96,8 @@ class Index_Builder:
         self.embedding_path = embedding_path
         self.save_embedding = save_embedding
         self.faiss_gpu = faiss_gpu
+        self.embedding_api_url = embedding_api_url
+        self.embedding_model_name = embedding_model_name
 
         self.gpu_num = torch.cuda.device_count()
         # prepare save dir
@@ -152,6 +163,7 @@ class Index_Builder:
                          "--input", temp_dir,
                          "--index", self.save_dir,
                          "--generator", "DefaultLuceneDocumentGenerator",
+                         "--storeRaw",
                          "--threads", "1"]
        
         subprocess.run(["python", "-m", "pyserini.index.lucene"] + pyserini_args)
@@ -185,7 +197,37 @@ class Index_Builder:
         else:
             memmap[:] = all_embeddings
 
+    def _batch_texts(self, start_idx, end_idx):
+        r"""Format a slice of the corpus into '"title"\ntext' strings,
+        supporting corpora with either (title, text) or contents fields.
+        """
+        batch = self.corpus[start_idx:end_idx]
+        columns = self.corpus.column_names
+        if 'title' in columns and 'text' in columns:
+            titles = batch['title']
+            texts = batch['text']
+        elif 'contents' in columns:
+            contents = batch['contents']
+            titles = [str(c).split('\n')[0].strip('"') for c in contents]
+            texts = ['\n'.join(str(c).split('\n')[1:]) for c in contents]
+        else:
+            raise ValueError(f"Corpus must contain title/text or contents fields, got {columns}")
+        return ['"' + str(title) + '"\n' + str(text) for title, text in zip(titles, texts)]
+
+    def _encode_all_api(self):
+        all_embeddings = []
+        for start_idx in tqdm(range(0, len(self.corpus), self.batch_size), desc='Inference Embeddings (API):'):
+            batch_data = self._batch_texts(start_idx, start_idx + self.batch_size)
+            emb = self.encoder.encode(batch_data, is_query=False)
+            all_embeddings.append(emb)
+        all_embeddings = np.concatenate(all_embeddings, axis=0)
+        all_embeddings = all_embeddings.astype(np.float32)
+        return all_embeddings
+
     def encode_all(self):
+        if self.embedding_api_url:
+            return self._encode_all_api()
+
         if self.gpu_num > 1:
             print("Use multi gpu!")
             self.encoder = torch.nn.DataParallel(self.encoder)
@@ -249,11 +291,26 @@ class Index_Builder:
         
         if os.path.exists(self.index_save_path):
             print("The index file already exists and will be overwritten.")
-        
-        self.encoder, self.tokenizer = load_model(model_path = self.model_path, 
-                                                  use_fp16 = self.use_fp16)
+
+        if self.embedding_api_url:
+            self.encoder = APIEncoder(
+                api_url=self.embedding_api_url,
+                model_name=self.embedding_model_name,
+                batch_size=self.batch_size,
+            )
+            self.tokenizer = None
+            print(
+                f"Using remote embedding API: {self.embedding_api_url} "
+                f"(model: {self.embedding_model_name})"
+            )
+        else:
+            self.encoder, self.tokenizer = load_model(model_path = self.model_path,
+                                                      use_fp16 = self.use_fp16)
         if self.embedding_path is not None:
-            hidden_size = self.encoder.config.hidden_size
+            if self.embedding_api_url:
+                hidden_size = self.encoder.encode("dimension probe").shape[-1]
+            else:
+                hidden_size = self.encoder.config.hidden_size
             corpus_size = len(self.corpus)
             all_embeddings = self._load_embedding(self.embedding_path, corpus_size, hidden_size)
         else:
@@ -311,6 +368,11 @@ def main():
     parser.add_argument('--embedding_path', default=None, type=str)
     parser.add_argument('--save_embedding', action='store_true', default=False)
     parser.add_argument('--faiss_gpu', default=False, action='store_true')
+    parser.add_argument('--embedding_api_url', default='none', type=str,
+                        help="OpenAI-compatible embedding API URL (e.g. vLLM serving bge-m3). "
+                             "'none' uses the local GPU encoder from --model_path.")
+    parser.add_argument('--embedding_model_name', default='bge-m3', type=str,
+                        help='Model name accepted by the embedding API.')
     
     args = parser.parse_args()
 
@@ -339,7 +401,9 @@ def main():
                         faiss_type = args.faiss_type,
                         embedding_path = args.embedding_path,
                         save_embedding = args.save_embedding,
-                        faiss_gpu = args.faiss_gpu
+                        faiss_gpu = args.faiss_gpu,
+                        embedding_api_url=None if args.embedding_api_url.lower() == 'none' else args.embedding_api_url,
+                        embedding_model_name=args.embedding_model_name
                     )
     index_builder.build_index()
 
