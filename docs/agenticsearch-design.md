@@ -751,6 +751,68 @@ skill:
   publish_threshold: 0.02 # 相对基线成功率提升阈值
 ```
 
+### 12.3 设计框架总结与接口设计 Prompt
+
+#### 12.3.1 设计框架总结（v1.1）
+
+**一句话**：AgenticSearch v1 = 无 RL 的智能体搜索服务 = 「兼容 s3 动作协议的执行循环」+「CRUD 式知识记忆库」+「全量轨迹存储」+「离线自进化 Skill」。
+
+**分层与关键决策**：
+
+1. agent/：loop（顺序循环，无 verl 依赖）+ policy（llm_policy / skill_policy）+ actions（兼容 `<query>` / `<search_complete>` / `<information>` / `<important_info>`）；
+2. 知识层：知识记忆库是独立子系统，多后端（图谱/向量/SQL/BM25/episodic）实现同一 CRUD 协议；Agent 工具化调用（读开、写受控）；自进化知识与记忆聚合经内部 Ingestor 直插，不经 Agent；
+3. 轨迹层：全量 turns 记录（action/observation/decision/latency），可回放、可评估、可转 v2 训练集；
+4. Skill 层：离线闭环 采集→评估→归纳→提炼→A/B 验证→发布→监控→淘汰；检索策略类知识作为"检索型 Skill"复用同一管线；
+5. 对外 API：`/retrieve` 向后兼容 + `/v1/agent` + `/v1/trajectories` + `/v1/skills` + `/v1/knowledge/query`（只读，写不对外）；
+6. 索引策略：基础索引离线批量构建（保质量），经验层做轻量自适应（重排权重/融合系数/改写规则），图谱作为"活索引"随轨迹进化。
+
+#### 12.3.2 接口设计 Prompt（可复用）
+
+> 用途：后续实现/扩展本系统时，可直接将以下 prompt 投给 LLM 生成或评审接口定义；也可作为人工评审 checklist。约定与正文 §5–§8 一致，冲突时以正文为准。
+
+```text
+你是 AgenticSearch 平台的接口设计者。请严格遵循以下契约输出接口定义（Python Protocol + REST 路由），不要引入契约之外的概念。
+
+[范围与红线]
+- 分层：agent(loop/policy/actions) / retrieval / knowledge(backends+ingestor) / skills / api / evaluation。
+- v1 不含 RL；动作协议必须兼容 <query>/<search_complete>/<information>/<important_info>。
+- /retrieve 接口签名向后兼容：{queries, topk, return_scores}；所有对外响应用标准信封 {code, data, message}，鉴权 X-Api-Key。
+- agent/ 不依赖 verl/；api/ 只依赖接口抽象；新代码不反向依赖 s3/。
+
+[知识记忆库 CRUD 契约]
+1. 对接收敛为四接口：query(查)/add(增)/update(改)/delete(删)，另加 batch_upsert(批量幂等合并)。
+2. 统一模型：
+   - KnowledgeItem{kind: entity|relation|document|row|snippet|fact, key(幂等键), content, meta{source, confidence, priority, ttl, tags}}
+   - KnowledgeQuery{query, mode: semantic|graph|sql|bm25|hybrid, kinds, seed_entities, topk, filters}
+   - KnowledgeHit{key, kind, content, score, evidence(可直接进 <information> 的可读文本)}
+3. 多后端实现同一协议：graph(Neo4j/Json/Sqlite/Remote)、vector(faiss/milvus)、sql(sqlite/postgres)、bm25(pyserini)、episodic(redis+TTL)。
+4. 写入路由配置驱动、可 fan-out：entity/relation→graph(+vector)；document/snippet→vector(+bm25)；row→sql；会话片段→episodic。BM25 重索引：在线只写暂存，重建走离线。
+
+[工具化规则]
+- knowledge_query：默认开启，主读工具，evidence 直接作为观测。
+- knowledge_add：受控开启，强制携带 source/confidence。
+- knowledge_update / knowledge_delete：默认关闭，仅管理员/进化管线。
+- 每次工具调用记入 Turn（含命中/写入条数），外层统一权限+审计+限流。
+
+[更新机制（不经 Agent，后台直插）]
+- 轨迹沉淀→add；自进化总结知识→add/update；多条记忆聚合→batch_upsert+旧条目软删；外部导入→batch_upsert。
+- 全部经 Ingestor：解析→路由→幂等 upsert→IngestReport{written, skipped, failed}（按 source 可追溯）。
+
+[轨迹契约]
+- Trajectory{trajectory_id, session_id, question, status, answer, turns[], evaluation, skills_used, knowledge_updates}。
+- Turn{turn_index, action, observation, decision{policy, skill_id, reason}, latency_ms, token_usage}。
+- 异步写入不阻塞主循环；存储：JSONL(按日) + SQLite 元数据 + faiss 语义索引。
+
+[Skill 自进化契约]
+- 生命周期 draft→active→deprecated，版本递增；stats 持续回写。
+- 进化闭环：采集→评估(EM/LLM-judge)→归纳(聚类)→提炼(LLM 生成 trigger+body)→A/B 验证(达阈值)→发布→监控→淘汰。
+- Skill 命中轨迹的新证据经 Ingestor 优先沉淀；进化产物（总结知识）直接 add 进知识库。
+
+[输出要求]
+- 先给 Protocol/Pydantic 定义，再给 REST 路由表（方法/路径/请求/响应/鉴权级别），最后列配置项与兼容性说明。
+- 任何新接口必须归入上述某一类；若不 fit，先在文档中扩展契约再实现。
+```
+
 ---
 
 *（本文档为 v1.1 草案：知识记忆库以 CRUD 四类接口对接、Agent 工具化调用、自进化知识/记忆聚合经内部更新机制直接插入。欢迎评审迭代。）*
