@@ -172,6 +172,13 @@
 
 系统由七个子系统/层次组成：**调用方 → 服务接入层（Edge）→ Agentic Search 核心层（Core）→ 能力编排层（Capabilities）→ 检索与数据适配层（DataPlane）**构成在线主链路；**观测与离线层（Obs）**以事件旁路挂在核心层；**外部系统（External）**在最外圈被网关与适配层对接。下图为本平台的**权威架构图**，后续所有设计（模块、目录、数据流、视图）均以此图为准：
 
+![Agentic Search 总体架构（权威架构图）](./images/architecture-overview.jpg)
+
+> 图片由 Mermaid 渲染生成（3200px 高清，可缩放查看）。若需修改后重新生成：编辑下方源码，用 mermaid-cli 或 mermaid.ink 渲染，替换 `docs/images/architecture-overview.jpg` 即可。
+
+<details>
+<summary>📐 架构图 Mermaid 源码（点击展开，仅用于编辑维护）</summary>
+
 ```mermaid
 graph TB
     subgraph Clients["调用方 (Clients)"]
@@ -266,6 +273,8 @@ graph TB
     Evolution -. "candidate only" .-> SkillRuntime
     Evolution -. "reviewed knowledge" .-> KnowledgeGateway
 ```
+
+</details>
 
 分层职责与设计原则（§3.1）的对应：
 
