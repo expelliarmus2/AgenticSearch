@@ -18,6 +18,8 @@ tensorflow/my_graph/*
 # C extensions
 *.so
 data
+# BrowseComp-Plus dataset (questions + corpus)
+data/browsecomp-plus
 sft/output/*
 sft/data/*
 
