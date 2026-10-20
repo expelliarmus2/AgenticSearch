@@ -1,27 +1,28 @@
-# AgenticSearch 平台设计文档（v1.1 · 不含 RL）
+# AgenticSearch 平台设计文档（v2.0 · 不含 RL）
 
-> 版本：v1.1（草案）｜v1.1 变更：知识记忆库对接收敛为 CRUD 四类接口，Agent 工具化调用 + 内部更新机制（自进化知识/记忆聚合直接插入）
+> 版本：v2.0｜v2.0 变更：重组为四部分交付结构——新增「第一部分：系统定位与核心设计」「第二部分：系统总体架构」，详细设计与落地章节据此对齐重排
+> 版本历史：v1.0 初稿；v1.1 知识记忆库对接收敛为 CRUD 四类接口（Agent 工具化 + 内部更新机制直插）；v2.0 结构化重组（本版）
 > 范围：基于现有 s3 / AgenticSearch 代码仓演进，**v1 阶段不包含 RL 训练**，但保留与 RL（verl）的接口兼容性，便于 v2 平滑接入。
 > 阅读对象：架构、算法、后端工程师。
 
----
+**文档导读**：
 
-## 1. 背景与目标
-
-现有代码仓（s3）是一个面向检索增强生成的搜索智能体框架，核心是"搜索助手（Search Copilot）"：模型输出 `<query>` / `<search_complete>` 等结构化动作，外部检索服务返回 `<information>` 观测，循环多轮直至给出答案。当前实现围绕 verl + PPO 的 RL 训练闭环（`verl/trainer/ppo/ray_trainer.py` 调用 `s3/llm_agent/generation_s3.py`）。
-
-**v1 设计目标**（不依赖 RL）：
-
-1. 把"智能体循环"从 RL 训练代码中解耦，成为可独立运行的推理服务；
-2. 支持**知识记忆库对接层**：以增删改查（CRUD）四类接口对接多种知识后端（知识图谱、向量库、SQL、BM25、短期记忆）；Agent 将 CRUD 当工具调用，自进化总结知识/多条记忆经内部更新机制直接插入；
-3. 支持**轨迹存储（Trajectory Storage）**：完整记录 agentic search 的每一步动作、观测、决策与评估，可回放、可检索；
-4. 支持**自进化 Skill**：从成功/失败轨迹中归纳、提炼、验证、发布技能，形成离线自进化闭环（非梯度式进化）；
-5. 定义清晰的**对外接口**（检索、智能体、轨迹、Skill、健康检查），与现状代码保持动作协议兼容；
-6. 支持**自进化索引（三层策略）**：基础索引离线批量构建保质量，经验层做轻量自适应（重排权重/融合系数/改写规则），图谱作为"活索引"随轨迹进化（§8.6）。
+- **第一部分（§1–§3）系统定位与核心设计**：为什么做、做什么、核心设计思想（原则/概念/决策）——评审入口；
+- **第二部分（§4–§5）系统总体架构**：系统如何组织——分层架构、模块职责、项目结构、关键数据流、运行与部署；
+- **第三部分（§6–§10）详细设计**：数据模型、知识记忆库 CRUD 接口、对外接口、轨迹存储、自进化 Skill 与索引；
+- **第四部分（§11–§14）视图与落地**：4+1 视图、迁移路线、里程碑验收、附录。
 
 ---
 
-## 2. 现状代码盘点（与设计的映射基础）
+# 第一部分：系统定位与核心设计
+
+## 1. 背景与问题定义
+
+### 1.1 现状：s3 智能体搜索框架
+
+现有代码仓（s3）是一个面向检索增强生成的搜索智能体框架，核心是"搜索助手（Search Copilot）"：模型输出 `<query>` / `<search_complete>` 等结构化动作，外部检索服务返回 `<information>` 观测，循环多轮直至给出答案。当前实现围绕 verl + PPO 的 RL 训练闭环（`verl/trainer/ppo/ray_trainer.py` 调用 `s3/llm_agent/generation_s3.py`），训练与推理共享同一套循环代码。
+
+### 1.2 现状代码盘点（与设计的映射基础）
 
 | 现有代码 | 作用 | 设计中的去向 |
 |---|---|---|
@@ -41,11 +42,127 @@
 | `utils/embedding_client.py` | OpenAI 兼容 embedding API 客户端 | 保留，供知识层（图谱实体/向量/轨迹摘要）向量化复用 |
 | `data/agentic/` | agentic 数据样例（s3_api_results.json 等） | 作为轨迹数据的雏形，转为标准轨迹格式 |
 
+### 1.3 核心问题定义
+
+| # | 问题 | 现状表现 |
+|---|---|---|
+| P1 | 循环与训练耦合 | 智能体循环嵌在 RL 训练框架（verl）内，无法作为独立推理服务部署与复用 |
+| P2 | 知识不沉淀 | 只有语料检索（BM25/Dense），无知识记忆层：跨会话经验、结构化知识、图谱关系无法写入与复用 |
+| P3 | 经验不可追溯 | 搜索过程不落盘：无法回放一次搜索的完整决策过程，无法诊断失败，无法复用成功经验 |
+| P4 | 策略不自进化 | 决策质量改进依赖人工迭代提示词与检索参数，无系统化的"归纳→验证→发布"机制 |
+| P5 | 接口不完整 | 对外仅 `/retrieve` 检索接口，缺智能体、轨迹、知识、技能等服务化接口 |
+
+**v1 的使命**：在不动 RL（verl）的前提下，把这套搜索智能体演进为一个"可服务化、可沉淀、可自进化"的平台，并为 v2 的 RL 训练保留数据与接口兼容。
+
 ---
 
-## 3. 总体架构与目标项目结构
+## 2. 系统定位
 
-### 3.1 总体架构（分层）
+### 2.1 定位陈述
+
+> **AgenticSearch 是一个可沉淀、可进化的智能体搜索平台**：以兼容 s3 动作协议的搜索智能体为核心，把每一次搜索产生的**轨迹、知识、经验**沉淀为平台资产（知识记忆库 / 轨迹库 / Skill 库），并通过**离线自进化闭环**持续改进检索与决策质量。
+
+三个关键词（分别回应 §1.3 的问题）：
+
+- **服务化**（P1/P5）：智能体循环脱离训练框架，成为可独立部署、可水平扩展的推理服务；
+- **资产化**（P2/P3）：轨迹、知识、经验全部落库，成为可查询、可复用、可训练的数据资产；
+- **自进化**（P4）：非梯度式（统计归纳 + LLM 提炼 + A/B 验证）的持续改进闭环，RL 留给 v2。
+
+### 2.2 目标用户与核心场景
+
+| 用户 | 场景 | 使用入口 |
+|---|---|---|
+| 算法/评测工程师 | 多跳问答评测、基线对比、批量实验 | `/v1/agent/tasks` + 轨迹评估回填 |
+| 应用开发者 | 把智能体搜索嵌入自有产品（客服、研究助手） | `/v1/agent/search` + `/retrieve` |
+| 平台算法工程师 | 知识库运营（导入/聚合/溯源）、Skill 进化运营 | Ingestor 脚本 + `/v1/skills` |
+| v2 训练（预留） | 用轨迹数据训练 RL 搜索策略 | 轨迹导出（parquet 兼容，§9.4） |
+
+### 2.3 与周边方案的关系
+
+| 方案 | 差异 |
+|---|---|
+| 朴素 RAG（单次检索 + 生成） | AgenticSearch 是多轮循环决策，检索是"动作"而非固定流程；且检索质量与搜索经验可沉淀、可进化 |
+| 通用 Agent 框架（LangChain / LangGraph 等） | 本平台面向"搜索"垂直域：动作协议与检索栈深度绑定；轨迹格式面向搜索评估/训练定制；自带非梯度自进化闭环 |
+| s3 / verl（RL 训练框架） | 本平台 v1 = s3 的服务化演进，**不含训练**；动作协议与数据格式保持兼容，v2 可回接 verl 训练 |
+
+### 2.4 范围与非目标
+
+**范围内（v1）**：智能体推理服务；知识记忆库 CRUD 对接（多后端）；轨迹存储与语义检索；离线 Skill 自进化；三层自进化索引；对外 REST API。
+
+**非目标（v1）**：RL/策略梯度训练（v2，`agent/loop/rl/` 预留）；在线重建倒排/向量索引（离线构建 + 热桶增量留 v2）；多智能体协作编排；图形界面。
+
+---
+
+## 3. 核心设计
+
+### 3.1 设计原则（后续章节的设计依据）
+
+| # | 原则 | 含义 | 主要落点 |
+|---|---|---|---|
+| D1 | 协议兼容优先 | `<query>`/`<search_complete>`/`<information>` 动作协议与 `/retrieve` 签名不变，存量调用方零破坏 | §8.1、§12 |
+| D2 | 读写分离 | 知识"读"对 Agent 开放为工具；"写"统一收口内部 Ingestor（受控 add 工具除外）；对外不暴露写 API | §7.2/§7.3 |
+| D3 | 一切皆轨迹 | 每轮动作/观测/决策/耗时全量落盘，评估、进化、诊断、训练共用同一数据底座 | §9 |
+| D4 | 进化非梯度 | v1 用"统计归纳 + LLM 提炼 + A/B 验证"替代 RL 获得持续改进，可解释、可回滚 | §10 |
+| D5 | 稳定索引 + 活参数 | 索引本体离线构建保稳定；在线只进化参数（重排/融合/改写）与图谱活索引 | §10.6 |
+| D6 | 可插拔后端 | 知识与轨迹存储统一 Protocol，多后端（图谱/向量/SQL/BM25/记忆）可替换、可组合 | §7.4、§9.2 |
+
+### 3.2 核心概念模型
+
+五个核心概念（可序列化的数据模型见 §6）：
+
+| 概念 | 一句话定义 |
+|---|---|
+| **Agent Loop** | 状态机式搜索循环：Policy 每轮决策动作（search / knowledge_query / answer…），工具执行产生观测，直至终止 |
+| **KnowledgeBase** | 知识记忆库：多后端统一 CRUD 协议的读写层，"读"服务检索增强，"写"沉淀平台经验 |
+| **Trajectory** | 一次搜索的完整记录（turns 全量），是评估、进化、诊断、训练的统一数据底座 |
+| **Skill** | 可复用的搜索经验单元（触发条件 + 执行体 + 统计），由离线进化管线生产与淘汰 |
+| **三层索引** | 基础索引（离线，稳）+ 经验层参数（在线自适应）+ 图谱活索引（随轨迹进化） |
+
+概念关系：
+
+```
+在线主链路:
+  question → Agent Loop ──(Policy 决策)──→ Action ──(Tool 执行)──→ Observation → … → answer
+                 │ 读                                      │ 全程记录
+                 ▼                                        ▼
+        KnowledgeBase / Retrieval                    Trajectory（轨迹库）
+
+离线进化闭环:
+  Trajectory ──评估──→ 归纳/聚类 ──LLM 提炼──→ Skill(draft) ──A/B 验证──→ active ──→ 反哺 Policy
+      │                                                        │
+      ├── Ingestor 沉淀（实体/关系/经验片段）──→ KnowledgeBase（图谱活索引）
+      └── 进化总结知识直接 add ──────────────→ KnowledgeBase
+```
+
+### 3.3 关键设计决策
+
+| 决策点 | 选择 | 理由 | 被否方案 |
+|---|---|---|---|
+| 知识库交互 | CRUD 四接口收敛（query/add/update/delete + batch_upsert） | 语义最小完备，Agent 工具化与内部更新机制共用一套契约 | 读/写/事件三类接口（事件流引入时序耦合，v1 无消费者） |
+| 知识写入路径 | 对外不暴露写 API，统一走 Ingestor（Agent 的 add 工具受控开启） | 保证可追溯（source）与幂等，防知识污染 | 开放写 API（溯源与质量不可控） |
+| 进化方式 | 离线非梯度（归纳 + 提炼 + A/B） | 无训练基础设施依赖；可解释、可回滚；v1 即可跑通闭环 | RL（依赖 verl 训练栈，v2）；在线即时进化（无验证闸门，风险高） |
+| 索引进化 | 三层：离线基础 + 在线参数 + 图谱活索引 | 兼顾稳定性（运行期索引只读）与进化性（参数与图谱可变） | 在线重建索引（延迟/一致性风险）；纯静态索引（无进化能力） |
+| 循环运行形态 | 独立推理服务（FastAPI），无 verl 依赖 | 服务化复用；RL 只是 v2 的一种 loop 实现 | 继续嵌在训练框架内 |
+| 轨迹存储 | JSONL + SQLite 元数据 + faiss 语义索引 | 零依赖起步、可回放、可语义召回、可转 parquet 训练格式 | 单一数据库（大文本检索弱）；纯日志文件（不可查询） |
+
+### 3.4 v1 设计目标
+
+**v1 设计目标**（不依赖 RL）：
+
+1. 把"智能体循环"从 RL 训练代码中解耦，成为可独立运行的推理服务；
+2. 支持**知识记忆库对接层**：以增删改查（CRUD）四类接口对接多种知识后端（知识图谱、向量库、SQL、BM25、短期记忆）；Agent 将 CRUD 当工具调用，自进化总结知识/多条记忆经内部更新机制直接插入；
+3. 支持**轨迹存储（Trajectory Storage）**：完整记录 agentic search 的每一步动作、观测、决策与评估，可回放、可检索；
+4. 支持**自进化 Skill**：从成功/失败轨迹中归纳、提炼、验证、发布技能，形成离线自进化闭环（非梯度式进化）；
+5. 定义清晰的**对外接口**（检索、智能体、轨迹、Skill、健康检查），与现状代码保持动作协议兼容；
+6. 支持**自进化索引（三层策略）**：基础索引离线批量构建保质量，经验层做轻量自适应（重排权重/融合系数/改写规则），图谱作为"活索引"随轨迹进化（§10.6）。
+
+---
+
+# 第二部分：系统总体架构
+
+## 4. 总体架构
+
+### 4.1 分层架构图
 
 ```
                     ┌─────────────────────────────────────────┐
@@ -83,7 +200,32 @@
    └──────────────────────────────────────────────────────┘
 ```
 
-### 3.2 目标项目结构
+分层职责与设计原则（§3.1）的对应：
+
+- **api/ 对外接口层**：统一 REST 信封与鉴权，隔离外部协议与内部实现；D1 协议兼容（`/retrieve` 原样透传）在此层落地；
+- **agent/ 智能体核心层**：loop / policy / actions / memory 四件套，平台中枢；动作协议兼容（D1）在 actions/parser 落地；
+- **tools/ 工具集**：把检索与知识 CRUD 包装为 Policy 可调用的动作；D2 读写分离在此层守门（工具开关与审计）；
+- **retrieval/ 检索层 + generator_llms/ 环境层**：语料检索与生成反馈，对 agent 只读；
+- **skills/ 自进化层**：消费轨迹、生产 Skill 与检索参数，反哺 policy 与检索（D4/D5）；
+- **知识/存储层**：图谱/向量/SQL/BM25/记忆/轨迹/索引，统一经接口访问（D6 可插拔）。
+
+### 4.2 模块职责一览
+
+| 模块 | 职责 | 关键接口/文件 |
+|---|---|---|
+| `agent/loop` | 驱动搜索循环：调 Policy 取动作、执行工具、记录 Turn、判终止 | `AgentLoop`、`sequential.py` |
+| `agent/policies` | 决策：`llm_policy`（LLM 直出）/ `skill_policy`（Skill 触发优先，llm 兜底） | `Policy.decide()` |
+| `agent/actions` | 动作模型与解析（兼容 `<query>`/`<search_complete>` 协议） | `parser.py`、`registry.py` |
+| `agent/memory` | 知识记忆库 CRUD 契约、Ingestor、后端适配、工作记忆、轨迹存储 | `KnowledgeBase`、`Ingestor` |
+| `retrieval/` | 语料检索（BM25/Dense/SERP/hybrid）、重排、经验层自适应 | `Retriever.search()` |
+| `skills/` | Skill 注册/执行/评估/自进化 | `SkillRegistry`、`evolution.py` |
+| `api/` | 对外 REST 服务装配（agent/trajectory/skill/retrieval） | FastAPI `app.py` |
+| `evaluation/` | EM/F1/LLM-judge、轨迹级评估、Skill A/B | `metrics.py` |
+| `generator_llms/` | 生成器 LLM 适配（答案生成、反馈），只读环境层 | 现状保留 |
+
+> 模块依赖与开发约束（禁止反向依赖等）见 §11.1 逻辑视图。
+
+### 4.3 目标项目结构
 
 ```
 AgenticSearch/
@@ -105,7 +247,7 @@ AgenticSearch/
 │   │   ├── action.py                  # Action 类型：search / knowledge_query / knowledge_add / answer ...
 │   │   ├── parser.py                  # 从模型输出解析动作（<query>/<search_complete> 兼容）
 │   │   └── registry.py                # 动作注册表
-│   ├── memory/                        # 知识记忆库对接层（§5）
+│   ├── memory/                        # 知识记忆库对接层（§7）
 │   │   ├── working_memory.py          # 工作记忆（当前轮次上下文滚动窗口）
 │   │   ├── knowledge_base.py          # CRUD 接口契约（query/add/update/delete/batch_upsert）
 │   │   ├── ingestor.py                # 内部更新机制：解析→路由→幂等写入（后台直插）
@@ -115,8 +257,8 @@ AgenticSearch/
 │   │   │   ├── sql.py                 # SQL/结构化知识（sqlite/postgres）
 │   │   │   ├── bm25.py                # BM25/全文（复用现状语料索引）
 │   │   │   └── episodic.py            # 短期记忆（TTL）
-│   │   └── trajectory_store.py        # 轨迹存储（§7）
-│   └── skills/                        # Skill 系统（§8）
+│   │   └── trajectory_store.py        # 轨迹存储（§9）
+│   └── skills/                        # Skill 系统（§10）
 │       ├── skill.py                   # Skill 模型与序列化
 │       ├── registry.py                # Skill 注册/检索/版本
 │       ├── executor.py                # Skill 执行器（提示词/工具序列）
@@ -132,22 +274,22 @@ AgenticSearch/
 │   │   ├── serp.py                    # 在线搜索引擎
 │   │   └── hybrid.py                  # 混合检索（稀疏+稠密+图谱+SQL 融合）
 │   ├── rerank.py                      # 重排服务
-│   ├── adaptive.py                    # 经验层自适应（重排权重/融合系数/改写规则，检索型 Skill 驱动，§8.6）
-│   └── knowledge_adapter.py          # 知识层适配（将知识命中转检索结果）
+│   ├── adaptive.py                    # 经验层自适应（重排权重/融合系数/改写规则，检索型 Skill 驱动，§10.6）
+│   └── knowledge_adapter.py           # 知识层适配（将知识命中转检索结果）
 ├── generator_llms/                    # 环境层（现状保留）
 │   ├── qwen_api.py / gpt_azure.py / claude_api.py / together_api.py / deepinfra.py / local.py
 │   └── query_rewrite.py
 ├── tools/
 │   ├── registry.py                    # 工具注册
 │   ├── retriever_tool.py              # 检索工具（search）
-│   ├── knowledge_tool.py              # 知识工具（CRUD 工具化：knowledge_query / knowledge_add，§5.2）
+│   ├── knowledge_tool.py              # 知识工具（CRUD 工具化：knowledge_query / knowledge_add，§7.2）
 │   └── answer_tool.py                 # 作答工具（调用 generator LLM）
 ├── api/                               # 对外服务层
 │   ├── app.py                         # FastAPI 应用装配
-│   ├── agent_api.py                   # 智能体服务（§6.2）
-│   ├── trajectory_api.py              # 轨迹服务（§6.3）
-│   ├── skill_api.py                   # Skill 服务（§6.4）
-│   ├── retrieval_api.py               # 检索服务（§6.1，复用现状）
+│   ├── agent_api.py                   # 智能体服务（§8.2）
+│   ├── trajectory_api.py              # 轨迹服务（§8.3）
+│   ├── skill_api.py                   # Skill 服务（§8.4）
+│   ├── retrieval_api.py               # 检索服务（§8.1，复用现状）
 │   └── schemas.py                     # Pydantic 请求/响应
 ├── evaluation/
 │   ├── metrics.py                     # EM / F1 / LLM-judge
@@ -167,11 +309,85 @@ AgenticSearch/
 └── s3/                                # 现状代码保留（过渡期），v1 目标迁入 agent/
 ```
 
+### 4.4 关键数据流
+
+**F1 在线问答流（同步，低延迟路径）**
+
+```
+Client → api/ → AgentLoop
+  → Policy.decide（skill_policy 优先，llm_policy 兜底）
+  → Action{search}          → retrieval/（POST /retrieve，D1 兼容）  → Observation
+  → Action{knowledge_query} → KnowledgeBase.query（多后端融合）       → Observation
+  → Action{answer}          → generator_llms（生成器 LLM）            → 最终答案
+  全程每轮 Turn 异步写入 TrajectoryStore（不阻塞主循环）
+```
+
+**F2 知识写入流（异步/后台，不经 Agent 主链路）**
+
+```
+Trajectory 结束  → Ingestor：实体/关系/经验片段 → add（图谱+向量）
+Skill 进化产出   → Ingestor：总结知识 → add/update（直接插入）
+定时聚合任务     → Ingestor：碎片记忆合并 → batch_upsert + 旧条目软删
+外部导入脚本     → Ingestor：批量知识 → batch_upsert
+（全部幂等、按 source 可追溯；契约见 §7.3）
+```
+
+**F3 离线进化流（定时批处理）**
+
+```
+TrajectoryRepository 拉取窗口期轨迹
+  → evaluator 打标（EM / LLM-judge）
+  → 归纳聚类（问题类型 / 动作序列 / 改写模式；失败模式反向归纳）
+  → LLM 提炼 Skill 草稿（trigger + body）
+  → A/B 验证（vs 基线，达阈值）
+  → 发布 active → 注入 skill_policy 与 retrieval/adaptive
+  → 监控 stats → 淘汰 / 迭代（详见 §10）
+```
+
+## 5. 运行与部署架构
+
+### 5.1 运行时视图（服务与进程）
+
+| 运行单元 | 形态 | 扩展方式 |
+|---|---|---|
+| Agent Service | FastAPI（api/ + agent loop，异步任务池） | 无状态，多实例水平扩展 |
+| Retriever Service | FastAPI `/retrieve` | 多实例 + 只读索引共享 |
+| Knowledge Backends | 图谱/向量/SQL/BM25/记忆，可合可拆 | 按后端独立扩缩 |
+| Trajectory Store | JSONL 写入 + SQLite 查询 + faiss 召回 | 单写者 + 读副本 |
+| Generator LLM | 外部 API 或本地 vLLM | 现成服务 |
+| 离线管道 | 定时任务（评估/进化/沉淀/聚合） | 独立节点，错峰执行 |
+
+> 完整进程交互与数据流见 §11.3 进程视图。
+
+### 5.2 部署拓扑
+
+v1 支持两种部署形态，配置驱动切换、代码路径不变：
+
+- **单机一体化**（默认，零外部依赖）：JsonGraph + faiss + sqlite + JSONL 轨迹，全部进程同机；
+- **分布式**：检索/知识/存储/离线分节点部署，图谱用 Neo4j、SQL 用 postgres、轨迹归档走对象存储。
+
+> 节点级拓扑示例见 §11.4 物理视图。
+
+### 5.3 技术选型与理由
+
+| 选型 | 理由 |
+|---|---|
+| FastAPI + Pydantic | 现状已是 FastAPI（`/retrieve`），异步友好，Schema 即文档 |
+| faiss + pyserini(Lucene) | 复用现状索引产物与脚本（`index_builder.py`），零迁移成本 |
+| sqlite → postgres | 开发/单机零依赖，生产平滑升级（SQL 后端同协议） |
+| Neo4j（可选图谱） | 生产大规模图谱；v1 默认 Json/Sqlite 图谱零依赖起步 |
+| JSONL + SQLite + faiss（轨迹） | 零依赖、可回放、可语义召回、可转 parquet 训练格式 |
+| vLLM / 云 API（LLM） | 决策与生成解耦，按需替换；现状 `generator_llms/` 适配器全保留 |
+
 ---
 
-## 4. 核心概念与数据模型
+# 第三部分：详细设计
 
-### 4.1 智能体循环（Agent Loop）
+## 6. 核心概念与数据模型
+
+本章把第一部分 §3.2 的核心概念（Loop / KnowledgeBase / Trajectory / Skill / KnowledgeItem）落为可序列化的数据模型，是所有子系统的公共语言。
+
+### 6.1 智能体循环（Agent Loop）
 
 循环沿用现状动作协议，但脱离 verl/RL 独立运行：
 
@@ -196,7 +412,7 @@ AgenticSearch/
    终止条件: answer 产出 / 最大轮次 / 超时 → 生成 Trajectory
 ```
 
-### 4.2 轨迹模型（Trajectory）
+### 6.2 轨迹模型（Trajectory）
 
 ```python
 @dataclass
@@ -236,7 +452,7 @@ class Trajectory:
     knowledge_updates: List[Dict] # 经 Ingestor 写入知识库的知识项（可追溯）
 ```
 
-### 4.3 Skill 模型（§8 详述）
+### 6.3 Skill 模型（§10 详述）
 
 ```python
 @dataclass
@@ -252,7 +468,7 @@ class Skill:
     source_trajectories: List[str]# 归纳来源轨迹
 ```
 
-### 4.4 知识项模型（KnowledgeItem / KnowledgeMeta）
+### 6.4 知识项模型（KnowledgeItem / KnowledgeMeta）
 
 ```python
 @dataclass
@@ -271,16 +487,16 @@ class KnowledgeItem:              # 知识记忆库统一写入单元（"增"的
     meta: KnowledgeMeta = None
 ```
 
----
+## 7. 知识记忆库对接接口（CRUD + 工具化 + 更新机制）
 
-## 5. 知识记忆库对接接口（CRUD + 工具化 + 更新机制）
+> 对应设计原则 **D2 读写分离**、**D6 可插拔后端**（§3.1）。
 
 现状代码只有检索后端（BM25/Dense）。v1 引入**知识记忆库对接层**：知识记忆库是独立子系统（支持多后端：知识图谱、向量库、SQL、BM25/全文、短期记忆，也可对接外部已有知识系统）。AgenticSearch 与它的全部交互收敛为**增删改查（CRUD）四类接口**，使用方式有两种：
 
 1. **工具化**：Agent 在决策循环中把 CRUD 接口当**工具**调用（读为主，写受控）；
 2. **更新机制（内部）**：自进化总结知识、多条记忆的聚合结果，由后台机制**直接插入**，不经 Agent。
 
-### 5.1 CRUD 接口契约
+### 7.1 CRUD 接口契约
 
 ```python
 # agent/memory/knowledge_base.py
@@ -327,7 +543,7 @@ class KnowledgeBase(Protocol):
 
 > `add` 与 `batch_upsert` 的区别：`add` 面向单条/小批量（Agent 工具或轨迹沉淀即时写入）；`batch_upsert` 面向更新机制的大批量（离线导入、记忆聚合、自进化产物），按 key 幂等合并。
 
-### 5.2 工具化：Agent 把 CRUD 当工具调用
+### 7.2 工具化：Agent 把 CRUD 当工具调用
 
 | 工具 | 对应接口 | 默认状态 | 说明 |
 |---|---|---|---|
@@ -338,18 +554,18 @@ class KnowledgeBase(Protocol):
 
 工具参数与 CRUD 契约一致，外层统一做**权限校验 + 审计日志 + 限流**；每次调用记录进 Turn（含命中/写入条数），保证可追溯。
 
-### 5.3 更新机制：后台直接插入（不经 Agent）
+### 7.3 更新机制：后台直接插入（不经 Agent）
 
 | 机制 | 触发时机 | 调用 | 说明 |
 |---|---|---|---|
 | 轨迹沉淀 | 轨迹结束（异步） | `add` | 成功轨迹抽取实体/关系/经验片段 → 图谱+向量 |
-| **自进化总结知识插入** | Skill 进化产出（§8） | `add`/`update` | 进化管线归纳出的成功模式总结、查询改写经验、领域知识摘要，**直接插入**知识库，供后续 `knowledge_query` 命中 |
+| **自进化总结知识插入** | Skill 进化产出（§10） | `add`/`update` | 进化管线归纳出的成功模式总结、查询改写经验、领域知识摘要，**直接插入**知识库，供后续 `knowledge_query` 命中 |
 | 多条记忆聚合 | 定时（离线） | `batch_upsert` + `update`/`delete` | 碎片记忆合并为总结性知识后批量写入；旧条目标记合并来源或软删 |
 | 外部导入 | 离线脚本 | `batch_upsert` | 语料/结构化知识批量入库 |
 
 所有更新机制共用 `Ingestor`（`agent/memory/ingestor.py`）：解析 → 按路由规则分发后端（可 fan-out）→ 幂等 upsert → 返回 IngestReport（写入数/跳过数/失败死信，均可按 source 追溯）。
 
-### 5.4 后端适配器
+### 7.4 后端适配器
 
 | 后端类型 | 适配器 | 存储 | 适用场景 |
 |---|---|---|---|
@@ -362,12 +578,12 @@ class KnowledgeBase(Protocol):
 | BM25 | `LuceneBm25Backend` | pyserini Lucene | 全文检索（复用现状索引） |
 | 记忆 | `EpisodicMemoryBackend` | 内存/redis + TTL | 会话级短期记忆 |
 
-> 路由规则（配置驱动）：`entity/relation`→图谱(+向量)；`document/snippet`→向量(+BM25)；`row`→SQL；会话片段→episodic（TTL）。向量化复用 `utils/embedding_client.APIEncoder`。BM25 属重索引型后端：在线只写暂存区，索引更新走离线构建路径（三层策略见 §8.6）。
+> 路由规则（配置驱动）：`entity/relation`→图谱(+向量)；`document/snippet`→向量(+BM25)；`row`→SQL；会话片段→episodic（TTL）。向量化复用 `utils/embedding_client.APIEncoder`。BM25 属重索引型后端：在线只写暂存区，索引更新走离线构建路径（三层策略见 §10.6）。
 
-### 5.5 智能体如何使用知识层
+### 7.5 智能体如何使用知识层
 
 1. **读**：`knowledge_query` 工具（graph/sql/bm25/hybrid 按需）+ `retrieval/backends/hybrid.py` 混合检索（BM25 稀疏 + e5 稠密 + 图谱子图 + SQL 结果融合进 `<information>`）；
-2. **写**：一律走内部 Ingestor（§5.3），对外不暴露写 API（如需人工导入走默认关闭的管理端点）。
+2. **写**：一律走内部 Ingestor（§7.3），对外不暴露写 API（如需人工导入走默认关闭的管理端点）。
 
 ```python
 # 沉淀示例（伪代码，全部走内部 Ingestor）
@@ -383,11 +599,13 @@ await kb.add([KnowledgeItem(kind="fact", key=f"skill:{sid}:summary",
 
 ---
 
-## 6. 对外接口（External APIs）
+## 8. 对外接口（External APIs）
+
+> 对应设计原则 **D1 协议兼容优先**（§3.1）。
 
 统一走 REST（FastAPI），鉴权 v1 用 API-Key 头（`X-Api-Key`），后续可加 OAuth。所有服务返回标准信封：`{"code": 0, "data": ..., "message": "ok"}`。
 
-### 6.1 检索接口（兼容现状，不破坏既有调用方）
+### 8.1 检索接口（兼容现状，不破坏既有调用方）
 
 ```
 POST /retrieve
@@ -397,7 +615,7 @@ Response: {"result": [[{"document": {"title":..., "text":..., "contents":...}, "
 
 新增可选字段：`mode`（`sparse|dense|hybrid|graph|sql`）、`knowledge`（知识层参数：`kinds`、`seed_entities`、`filters`）。
 
-### 6.2 智能体服务（Agent API）
+### 8.2 智能体服务（Agent API）
 
 ```
 POST /v1/agent/search          # 同步单轮问答
@@ -413,7 +631,7 @@ GET  /v1/agent/tasks/{task_id} # 查询任务状态与结果
 POST /v1/agent/sessions/{sid}/continue   # 多轮会话续接
 ```
 
-### 6.3 轨迹服务（Trajectory API）
+### 8.3 轨迹服务（Trajectory API）
 
 ```
 POST /v1/trajectories          # 写入轨迹（由智能体内部调用或外部导入）
@@ -424,7 +642,7 @@ POST /v1/trajectories/{id}/evaluate   # 对轨迹执行评估并回填 evaluatio
 DELETE /v1/trajectories/{id}
 ```
 
-### 6.4 Skill 服务（Skill API）
+### 8.4 Skill 服务（Skill API）
 
 ```
 GET    /v1/skills?status=active
@@ -432,11 +650,11 @@ POST   /v1/skills              # 手动创建 skill
 PUT    /v1/skills/{id}         # 更新（版本递增）
 POST   /v1/skills/{id}/publish # draft → active
 POST   /v1/skills/{id}/deprecate
-POST   /v1/skills/evolution    # 触发离线自进化一轮（§8）
+POST   /v1/skills/evolution    # 触发离线自进化一轮（§10）
 GET    /v1/skills/{id}/stats   # 使用统计/成功率
 ```
 
-### 6.5 系统接口与知识查询
+### 8.5 系统接口与知识查询
 
 ```
 GET  /health               # 存活与依赖探活（retriever/knowledge backends/store）
@@ -444,9 +662,9 @@ GET  /v1/config            # 运行配置（模型、检索、知识后端与工
 POST /v1/knowledge/query   # （可选）知识库统一只读查询，聚合多后端
 ```
 
-> **写接口约定**：知识记忆库的 add/update/delete **不提供对外 API**（§5），由 Agent 工具（受控）与内部更新机制（Ingestor）调用；外部批量导入走默认关闭的管理端点。
+> **写接口约定**：知识记忆库的 add/update/delete **不提供对外 API**（§7），由 Agent 工具（受控）与内部更新机制（Ingestor）调用；外部批量导入走默认关闭的管理端点。
 
-### 6.6 接口契约总览
+### 8.6 接口契约总览
 
 | 接口 | 方法 | 用途 | 鉴权 | 现状兼容 |
 |---|---|---|---|---|
@@ -461,11 +679,11 @@ POST /v1/knowledge/query   # （可选）知识库统一只读查询，聚合多
 
 > **接口治理**：任何新接口必须归入上述某一类（检索/智能体/轨迹/Skill/知识查询/系统）；若不 fit，先在本文档扩展契约再实现。对外响应统一标准信封 `{code, data, message}`，鉴权用 `X-Api-Key` 头。
 
----
+## 9. 轨迹存储设计
 
-## 7. 轨迹存储设计
+> 对应设计原则 **D3 一切皆轨迹**（§3.1）。
 
-### 7.1 存储形态
+### 9.1 存储形态
 
 | 数据 | 存储 | 说明 |
 |---|---|---|
@@ -474,7 +692,7 @@ POST /v1/knowledge/query   # （可选）知识库统一只读查询，聚合多
 | 语义索引 | faiss（轨迹摘要 embedding） | `/v1/trajectories/search` 相似召回 |
 | 归档 | S3/OSS 兼容 | 冷数据迁移 |
 
-### 7.2 Repository 接口
+### 9.2 Repository 接口
 
 ```python
 class TrajectoryRepository(Protocol):
@@ -487,7 +705,7 @@ class TrajectoryRepository(Protocol):
 
 实现：`FileTrajectoryRepository`（v1 默认，JSONL+SQLite）、`S3TrajectoryRepository`、`MemoryTrajectoryRepository`（测试用）。
 
-### 7.3 写入时序
+### 9.3 写入时序
 
 ```
 Policy 每产生一个动作 → Turn 记录进内存缓冲
@@ -497,23 +715,23 @@ Policy 每产生一个动作 → Turn 记录进内存缓冲
                    → 异步触发知识沉淀(Ingestor) + skill 评估打标
 ```
 
-### 7.4 轨迹的用途
+### 9.4 轨迹的用途
 
 1. **回放与调试**：`trajectory_id` 定位任何一次搜索的完整过程；
 2. **评估**：批量回填 EM/LLM-judge，产出成功率、平均轮次、检索命中质量等指标；
-3. **Skill 进化输入**（§8）：归纳源；
-4. **知识沉淀输入**（§5.3）：经 Ingestor 写入知识库；
+3. **Skill 进化输入**（§10）：归纳源；
+4. **知识沉淀输入**（§7.3）：经 Ingestor 写入知识库；
 5. **v2 训练数据源**：格式与现有 `scripts/data_process` 的 parquet 兼容，可直接转 RL 训练集。
 
----
+## 10. 自进化 Skill 设计
 
-## 8. 自进化 Skill 设计
+> 对应设计原则 **D4 进化非梯度**、**D5 稳定索引 + 活参数**（§3.1）。
 
-### 8.1 定义
+### 10.1 定义
 
 Skill = 一组"触发条件 + 执行体（提示词模板/工具序列/代码）+ 统计"，用于把反复成功的搜索经验固化为可复用组件。**v1 的自进化是离线、增量、基于轨迹统计与 LLM 归纳的**，不做策略梯度优化（RL 留给 v2）。
 
-### 8.2 Skill 生命周期
+### 10.2 Skill 生命周期
 
 ```
 采集(轨迹) → 评估(打标) → 归纳(聚类成功模式) → 提炼(LLM 生成 skill 草稿)
@@ -521,7 +739,7 @@ Skill = 一组"触发条件 + 执行体（提示词模板/工具序列/代码）
    → 监控(stats) → 淘汰(deprecated) 或 迭代(v+1)
 ```
 
-### 8.3 自进化循环（离线批处理）
+### 10.3 自进化循环（离线批处理）
 
 **Step 1 采集**：从 `TrajectoryRepository` 拉取最近 N 条轨迹（如 7 天 / 5000 条）。
 
@@ -552,7 +770,7 @@ Skill = 一组"触发条件 + 执行体（提示词模板/工具序列/代码）
 - 连续低分（如成功率 < 阈值且使用次数足够）→ `deprecated`；
 - 高分 skill 可触发再迭代（基于新轨迹优化版本号）。
 
-### 8.4 Policy 如何消费 Skill
+### 10.4 Policy 如何消费 Skill
 
 ```python
 class SkillPolicy(Policy):
@@ -563,19 +781,19 @@ class SkillPolicy(Policy):
         # 4) 记录 decision.skill_id 到 Turn（供统计与进化）
 ```
 
-### 8.5 与知识记忆库的联动
+### 10.5 与知识记忆库的联动
 
 - Skill 触发时优先 `knowledge_query` 复用既有知识证据；
 - 高置信 skill 命中的轨迹，其新证据经 Ingestor 优先沉淀；
 - 进化管线产出的**总结知识（成功模式、改写经验）直接 add 进知识库**，供后续查询命中；
 - 进化归纳时读取图谱子图与 SQL 统计（成功率、命中率），辅助聚类与验证。
 
-### 8.6 自进化索引（三层策略）与检索型 Skill
+### 10.6 自进化索引（三层策略）与检索型 Skill
 
 索引不采用"在线重建"路线，而是三层分工，兼顾稳定性与进化性：
 
 1. **基础索引层（离线，保质量）**：语料本体（faiss/BM25）走离线批量构建（`scripts/index_build/`），构建产物可验证、可回滚，运行期只读；
-2. **经验层（在线参数，轻量自适应）**：不重建索引，只进化"索引之上的参数"——重排权重、混合检索融合系数、查询扩展/改写词典与规则；这些参数由**检索型 Skill** 承载（`retrieval/adaptive.py`），复用 §8.3 的进化闭环（从轨迹成败归纳 → A/B 验证 → 发布）；高频新增语料先进"热桶"小索引，定期离线合并进主索引；
+2. **经验层（在线参数，轻量自适应）**：不重建索引，只进化"索引之上的参数"——重排权重、混合检索融合系数、查询扩展/改写词典与规则；这些参数由**检索型 Skill** 承载（`retrieval/adaptive.py`），复用 §10.3 的进化闭环（从轨迹成败归纳 → A/B 验证 → 发布）；高频新增语料先进"热桶"小索引，定期离线合并进主索引；
 3. **图谱活索引层（随轨迹进化）**：运行经验（实体/关系/证据）经 Ingestor 持续沉淀进图谱，查询时经混合检索融合图谱子图——图谱本身就是随轨迹自进化的"活索引"。
 
 **检索型 Skill 清单（示例）**：
@@ -583,13 +801,17 @@ class SkillPolicy(Policy):
 - 查询改写模式：追问式、拆解式、同义扩展、实体限定；
 - 融合系数与重排权重的调整规则。
 
-**落地节奏**：v1 先做 基础索引（现状）+ 图谱活索引（§5）+ 检索型 Skill 起步（零重建风险）；热桶增量索引留 v2（时效性需求出现时）。
+**落地节奏**：v1 先做 基础索引（现状）+ 图谱活索引（§7）+ 检索型 Skill 起步（零重建风险）；热桶增量索引留 v2（时效性需求出现时）。
 
 ---
 
-## 9. 4+1 视图
+# 第四部分：视图与落地
 
-### 9.1 逻辑视图（Logical View）
+## 11. 4+1 视图
+
+> 本章与第二部分的关系：§4 给出架构总览，本章按 4+1 视图规范完整刻画系统；逻辑视图的依赖规则、进程/物理视图的细节是 §4/§5 的规范化展开。
+
+### 11.1 逻辑视图（Logical View）
 
 ```
 api/ ──→ agent/ (loop → policy → actions)
@@ -608,7 +830,7 @@ api/ ──→ agent/ (loop → policy → actions)
 - 知识/存储访问一律通过接口（`KnowledgeBase` CRUD / `TrajectoryRepository`），后端可插拔替换；
 - 现状 `s3/` 代码在过渡期保留，新代码禁止反向依赖 `s3/`（除 `s3/search/retrieval_server.py` 先被 `retrieval/server.py` 包装复用）。
 
-### 9.2 开发视图（Development View）
+### 11.2 开发视图（Development View）
 
 ```
 包: agent / retrieval / generator_llms / tools / api / evaluation / scripts / utils
@@ -619,7 +841,7 @@ CI:  lint → unit → integration → contract
 
 模块间通过类型注解 + Protocol 依赖，便于 mock 与并行开发。
 
-### 9.3 进程视图（Process View）
+### 11.3 进程视图（Process View）
 
 ```
 进程1 Agent Service (api/agent_api + agent loop)
@@ -643,7 +865,7 @@ Agent Service → Trajectory Store(写轨迹)
 Trajectory Store / Skill进化 → Ingestor → Knowledge Base(add/batch_upsert)
 ```
 
-### 9.4 物理视图（Physical View）
+### 11.4 物理视图（Physical View）
 
 ```
 ┌─ 部署拓扑（示例，可单机全合一）─────────────────────────┐
@@ -660,21 +882,19 @@ Trajectory Store / Skill进化 → Ingestor → Knowledge Base(add/batch_upsert)
     图谱、SQL、BM25 为 CPU 型后端；轨迹存储可挂载同一磁盘或走对象存储。
 ```
 
-### 9.5 场景视图（Scenarios / 用例）
+### 11.5 场景视图（Scenarios / 用例）
 
 | 用例 | 主流程 |
 |---|---|
 | **U1 单轮多跳问答** | 用户提问 → `skill_policy` 匹配 skill → 多轮 search/knowledge_query → answer → 轨迹入库 |
 | **U2 知识增强检索** | 问题命中知识库（图谱/向量/SQL）→ 证据混入 `<information>` → 回答更精准 → 轨迹经 Ingestor 沉淀回写 |
 | **U3 历史轨迹复用** | 新问题与历史轨迹语义相似 → `/v1/trajectories/search` 召回 → 注入 prompt 作为参考 |
-| **U4 Skill 自进化** | 离线批处理：轨迹评估 → 聚类 → LLM 提炼 skill → A/B 验证 → 发布/淘汰（§8） |
+| **U4 Skill 自进化** | 离线批处理：轨迹评估 → 聚类 → LLM 提炼 skill → A/B 验证 → 发布/淘汰（§10） |
 | **U5 批量评测** | `/v1/agent/tasks` 提交 N 个问题 → 异步跑完 → 评估回填 → 报告 |
 | **U6 失败诊断** | 定位 `trajectory_id` → 回放 turns → 定位失败轮（过早 answer / 查询失败 / 知识未命中） |
 | **U7 自进化索引** | 轨迹评估发现检索弱项 → 归纳检索型 Skill（改写/融合权重）→ A/B 验证 → 发布生效；图谱证据随轨迹持续沉淀 |
 
----
-
-## 10. 与现状代码的迁移路线（不含 RL）
+## 12. 与现状代码的迁移路线（不含 RL）
 
 | 阶段 | 内容 | 交付物 |
 |---|---|---|
@@ -682,7 +902,7 @@ Trajectory Store / Skill进化 → Ingestor → Knowledge Base(add/batch_upsert)
 | M1 骨架化 | 新建 `agent/`、`api/`、`retrieval/backends`；复用 `generation_s3.postprocess_predictions` 作为 `actions/parser`；复用 `retrieval_server.py` 为 `retrieval/server.py` | v1 可运行的单轮搜索服务（无 RL） |
 | M2 轨迹 | 实现 `trajectory_store` + `/v1/trajectories`；智能体循环全量记录 turns | 轨迹可存可查可回放 |
 | M3 知识层 | 实现 `KnowledgeBase` CRUD + Ingestor + 图谱/向量/SQL/BM25 适配器（先 Json/Sqlite/faiss/pyserini）+ `knowledge_query/add` 工具 + 混合检索 | 知识记忆库接入智能体（CRUD 工具化） |
-| M4 Skill | 实现 skill 模型/registry/executor + 评估 + 自进化管线 + A/B + 检索型 Skill（经验层自适应，§8.6） | 自进化闭环（含检索自适应） |
+| M4 Skill | 实现 skill 模型/registry/executor + 评估 + 自进化管线 + A/B + 检索型 Skill（经验层自适应，§10.6） | 自进化闭环（含检索自适应） |
 | M5 打磨 | 异步任务、鉴权、监控、评测脚本统一、文档 | 生产可用 v1 |
 | M6（v2，预留） | 基于轨迹数据 + `agent/loop/rl/` 适配 verl 接入 RL；`s3/` 代码退役 | RL 训练闭环 |
 
@@ -692,9 +912,7 @@ Trajectory Store / Skill进化 → Ingestor → Knowledge Base(add/batch_upsert)
 - 轨迹数据可直接转换为现有 parquet 训练格式（`scripts/data_process` 复用）；
 - verl 侧 `LLMGenerationManager.run_llm_loop` 逻辑可整体迁移为 v2 的一个 loop 实现，接口签名保留。
 
----
-
-## 11. 里程碑与验收
+## 13. 里程碑与验收
 
 | 里程碑 | 验收标准 |
 |---|---|
@@ -706,9 +924,9 @@ Trajectory Store / Skill进化 → Ingestor → Knowledge Base(add/batch_upsert)
 
 ---
 
-## 12. 附录
+## 14. 附录
 
-### 12.1 关键接口契约示例（JSON）
+### 14.1 关键接口契约示例（JSON）
 
 ```json
 // POST /v1/agent/search
@@ -743,7 +961,7 @@ Trajectory Store / Skill进化 → Ingestor → Knowledge Base(add/batch_upsert)
 }
 ```
 
-### 12.2 配置示例（config/agent.yaml）
+### 14.2 配置示例（config/agent.yaml）
 
 ```yaml
 agent:
@@ -771,11 +989,13 @@ skill:
   publish_threshold: 0.02 # 相对基线成功率提升阈值
 ```
 
-### 12.3 设计框架总结与接口设计 Prompt
+### 14.3 设计框架总结与接口设计 Prompt
 
-#### 12.3.1 设计框架总结（v1.1）
+#### 14.3.1 设计框架总结（v2.0）
 
-**一句话**：AgenticSearch v1 = 无 RL 的智能体搜索服务 = 「兼容 s3 动作协议的执行循环」+「CRUD 式知识记忆库」+「全量轨迹存储」+「离线自进化 Skill」。
+**一句话**：AgenticSearch v1 = 无 RL 的智能体搜索平台 = 「兼容 s3 动作协议的执行循环」+「CRUD 式知识记忆库」+「全量轨迹存储」+「离线自进化 Skill」，以**服务化、资产化、自进化**回应现状五大问题（§1.3）。
+
+**文档结构**：第一部分 定位与核心设计（§1–§3）→ 第二部分 总体架构（§4–§5）→ 第三部分 详细设计（§6–§10）→ 第四部分 视图与落地（§11–§14）。
 
 **分层与关键决策**：
 
@@ -784,11 +1004,11 @@ skill:
 3. 轨迹层：全量 turns 记录（action/observation/decision/latency），可回放、可评估、可转 v2 训练集；
 4. Skill 层：离线闭环 采集→评估→归纳→提炼→A/B 验证→发布→监控→淘汰；检索策略类知识作为"检索型 Skill"复用同一管线；
 5. 对外 API：`/retrieve` 向后兼容 + `/v1/agent` + `/v1/trajectories` + `/v1/skills` + `/v1/knowledge/query`（只读，写不对外）；
-6. 索引策略：基础索引离线批量构建（保质量），经验层做轻量自适应（重排权重/融合系数/改写规则），图谱作为"活索引"随轨迹进化（详见 §8.6）。
+6. 索引策略：基础索引离线批量构建（保质量），经验层做轻量自适应（重排权重/融合系数/改写规则），图谱作为"活索引"随轨迹进化（详见 §10.6）。
 
-#### 12.3.2 接口设计 Prompt（可复用）
+#### 14.3.2 接口设计 Prompt（可复用）
 
-> 用途：后续实现/扩展本系统时，可直接将以下 prompt 投给 LLM 生成或评审接口定义；也可作为人工评审 checklist。约定与正文 §5–§8 一致，冲突时以正文为准。
+> 用途：后续实现/扩展本系统时，可直接将以下 prompt 投给 LLM 生成或评审接口定义；也可作为人工评审 checklist。约定与正文 §7–§10 一致，冲突时以正文为准。
 
 ```text
 你是 AgenticSearch 平台的接口设计者。请严格遵循以下契约输出接口定义（Python Protocol + REST 路由），不要引入契约之外的概念。
@@ -835,4 +1055,4 @@ skill:
 
 ---
 
-*（本文档为 v1.1 草案：知识记忆库以 CRUD 四类接口对接、Agent 工具化调用、自进化知识/记忆聚合经内部更新机制直接插入。欢迎评审迭代。）*
+*（本文档为 v2.0 交付件：重组为「第一部分 系统定位与核心设计 → 第二部分 系统总体架构 → 第三部分 详细设计 → 第四部分 视图与落地」四部分结构；知识记忆库以 CRUD 四类接口对接、Agent 工具化调用、自进化知识/记忆聚合经内部更新机制直接插入。欢迎评审迭代。）*
