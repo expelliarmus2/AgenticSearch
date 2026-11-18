@@ -61,3 +61,27 @@ bash scripts/local/train_grpo_local.sh
 - 检索语料为每条问题一条"答案文档"（含 golden answer）+ 干扰文档，保证检索有正信号
 - 目标只是**跑通训练循环**（rollout → reward → advantage → policy update），
   不是复现 s3 的 SOTA 效果
+
+## 更新（最终可运行版）—— 15GB RAM / 8GB 显存下的关键修复
+
+跑通后继续踩出的坑（本机 15GB 内存是比显存更紧的瓶颈）：
+
+| 问题 | 症状 | 修复 |
+|---|---|---|
+| Ray OOM 杀 worker | `OutOfMemoryError: Task was killed`（actor+ref 同一 worker 占 ~10GB） | ① `use_kl_loss=false` → 不建 ref worker（省 ~2GB）；② 优化器用 SGD（省掉 Adam 的 2×params 状态，`+actor_rollout_ref.actor.optim.optimizer=sgd`）；③ `RAY_object_store_memory=1GB`；④ `RAY_memory_usage_threshold=0.98` |
+| `rollout.n=2` 与 s3 循环 batch 不对齐 | s3 的 `run_llm_loop` 按“每行一条轨迹”设计 | `fit()` 的 do_search 分支先 `gen_batch.repeat(n)` 再进循环，与 `batch.repeat(n)` 对齐 |
+| 奖励恒 0.5 | `compute_score_local` 把 prompt 里 few-shot 示例 `<answer> Beijing </answer>` 当成了模型答案 | 只在 `Question:` 之后的“策略区”提取 `<answer>/<query>` |
+| verbose 答案 F1 拿不到分 | golden 只有 1-2 个 token，普通 F1 阈值 0.5 几乎不可达 | 加子串包含匹配（golden 出现在预测中即命中） |
+| retriever 与训练抢 GPU | e5 编码上 GPU，训练显存更紧 | `S3_RETRIEVER_DEVICE=cpu` 启动（CPU 编码 4 条查询 <1s） |
+| 0.5B 模型答不对 NQ 题 | 奖励全相同 → advantage 恒 0 → `pg_loss=0` | 训练数据换成 4 道简单题（首都/蜘蛛腿等），golden 在检索文档里；跑 2 steps 即可见 `utility_1_gen_1>0`、`grad_norm>0` |
+
+## 最终验证结果（本次会话）
+
+```
+step:1 - reward/mean:0.800 - score max:2.500 min:0.100 - pg_loss:0.059 - grad_norm:6.312
+step:2 - reward/mean:1.300 - reward/utility_1_gen_1:0.250 - pg_loss:-0.047 - grad_norm:5.250
+```
+
+- 检索循环真实触发：`ACTIVE_TRAJ_NUM: [4,4,4,4,4,0]`，每轮 4 条轨迹，valid_search=2
+- checkpoint 正常保存：`verl_checkpoints/<exp>/actor/global_step_{1,2}/`（含 model.safetensors + tokenizer）
+- 单步 ~90-100s（Pascal fp32 + CPU offload）：gen ~30s / update_actor ~35-60s / save ~7s
