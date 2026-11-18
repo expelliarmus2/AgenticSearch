@@ -44,13 +44,19 @@ def load_docs(corpus, doc_idxs):
     results = [corpus[int(idx)] for idx in doc_idxs]
     return results
 
+_RETRIEVER_DEVICE = os.environ.get('S3_RETRIEVER_DEVICE', 'cuda')
+
 def load_model(model_path: str, use_fp16: bool = False):
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
-    model.cuda()
-    if use_fp16: 
-        model = model.half()
+    if _RETRIEVER_DEVICE == 'cuda' and torch.cuda.is_available():
+        model.cuda()
+        if use_fp16:
+            model = model.half()
+    else:
+        # CPU mode: fp16 not supported for most ops, keep fp32
+        pass
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
     return model, tokenizer
 
@@ -103,7 +109,8 @@ class Encoder:
                                 truncation=True,
                                 return_tensors="pt"
                                 )
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+        _dev = 'cuda' if (_RETRIEVER_DEVICE == 'cuda' and torch.cuda.is_available()) else 'cpu'
+        inputs = {k: v.to(_dev) for k, v in inputs.items()}
 
         if "T5" in type(self.model).__name__:
             # T5-based retrieval model
@@ -127,7 +134,8 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
         
         del inputs, output
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available() and _RETRIEVER_DEVICE == 'cuda':
+            torch.cuda.empty_cache()
 
         return query_emb
 
@@ -293,7 +301,8 @@ class DenseRetriever(BaseRetriever):
             scores.extend(batch_scores)
             
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available() and _RETRIEVER_DEVICE == 'cuda':
+                torch.cuda.empty_cache()
             
         if return_score:
             return results, scores
@@ -372,11 +381,15 @@ def retrieve_endpoint(request: QueryRequest):
         request.topk = config.retrieval_topk  # fallback to default
 
     # Perform batch retrieval
-    results, scores = retriever.batch_search(
+    batch_out = retriever.batch_search(
         query_list=request.queries,
         num=request.topk,
         return_score=request.return_scores
     )
+    if request.return_scores:
+        results, scores = batch_out
+    else:
+        results, scores = batch_out, None
     
     # Format response
     resp = []

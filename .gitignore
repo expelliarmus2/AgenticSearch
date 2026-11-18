@@ -151,3 +151,6 @@ evaluate_check.sh
 *.csv
 *.ipynb
 *.pdf
+# local RL run artifacts
+models/
+verl_checkpoints/

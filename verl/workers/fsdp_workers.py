@@ -164,7 +164,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                 torch_dtype=torch_dtype,
                                                                 config=actor_model_config,
-                                                                attn_implementation='flash_attention_2',
+                                                                attn_implementation='sdpa',
                                                                 trust_remote_code=trust_remote_code)
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
@@ -185,7 +185,7 @@ class ActorRolloutRefWorker(Worker):
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
         else:
-            param_dtype = torch.bfloat16
+            param_dtype = torch.float32
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
@@ -226,10 +226,18 @@ class ActorRolloutRefWorker(Worker):
         # TODO: add more optimizer args into config
         if self._is_actor:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup
-            actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
-                                          lr=optim_config.lr,
-                                          betas=optim_config.get('betas', (0.9, 0.999)),
-                                          weight_decay=optim_config.get('weight_decay', 1e-2))
+            # SGD keeps optimizer state small (no Adam exp_avg/exp_avg_sq => -2x params
+            # memory), which matters on a 15GB-RAM box with CPU-offloaded FSDP.
+            optimizer_name = str(optim_config.get('optimizer', 'adamw')).lower()
+            if optimizer_name == 'sgd':
+                actor_optimizer = optim.SGD(actor_module_fsdp.parameters(),
+                                            lr=optim_config.lr,
+                                            momentum=optim_config.get('momentum', 0.9))
+            else:
+                actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
+                                              lr=optim_config.lr,
+                                              betas=optim_config.get('betas', (0.9, 0.999)),
+                                              weight_decay=optim_config.get('weight_decay', 1e-2))
 
             total_steps = optim_config.get('total_training_steps', 0)
             num_warmup_steps_ratio = optim_config.get('lr_warmup_steps_ratio', 0.)
@@ -620,7 +628,7 @@ class CriticWorker(Worker):
             critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
                                                                             config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation='sdpa',
                                                                             trust_remote_code=trust_remote_code)
 
             # some parameters may not in torch_dtype
@@ -640,7 +648,7 @@ class CriticWorker(Worker):
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
         else:
-            param_dtype = torch.bfloat16
+            param_dtype = torch.float32
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
@@ -860,7 +868,7 @@ class RewardModelWorker(Worker):
             reward_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             config=model_config,
                                                                             torch_dtype=torch.bfloat16,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation='sdpa',
                                                                             trust_remote_code=trust_remote_code)
             reward_module.to(torch.bfloat16)
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)

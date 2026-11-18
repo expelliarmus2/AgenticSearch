@@ -31,7 +31,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 
-from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+# flash_attn only needed for use_remove_padding; imported lazily (Pascal has no flash-attn)
 
 __all__ = ['DataParallelPPOCritic']
 
@@ -59,6 +59,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             position_ids = micro_batch['position_ids']
 
             if self.use_remove_padding:
+                from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)

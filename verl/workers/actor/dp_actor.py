@@ -31,7 +31,9 @@ from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_u
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
 
-from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+# flash_attn is only required for use_remove_padding (unpad_input/pad_input),
+# which needs Ampere+; import lazily so Pascal can run without it.
+# from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
 __all__ = ['DataParallelPPOActor']
 
@@ -53,7 +55,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-        self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+        # Triton (torch.compile) requires sm_70+; Pascal falls back to eager
+        self.compute_entropy_from_logits = verl_F.entropy_from_logits
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -62,13 +65,15 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs: # (bs, response_len)
         """
         response_length = micro_batch['responses'].size(-1)
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        # Pascal has no native bf16: run fp32
+        with torch.autocast(device_type='cuda', dtype=torch.float32):
             input_ids = micro_batch['input_ids']
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch['attention_mask']
             position_ids = micro_batch['position_ids']
 
             if self.use_remove_padding:
+                from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
@@ -114,6 +119,7 @@ class DataParallelPPOActor(BasePPOActor):
                                                             unpad_dim=0,
                                                             padding_size=pad_size)
                 # pad back to (bsz, seqlen)
+                from flash_attn.bert_padding import pad_input
                 full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
                                          indices=indices,
                                          batch=batch_size,

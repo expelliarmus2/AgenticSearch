@@ -6,7 +6,7 @@ from verl import DataProto
 import torch
 # from verl.utils.reward_score import rag, ppl, rag_new
 # from verl.utils.reward_score import rag_new
-from verl.utils.reward_score import rag_2
+from verl.utils.reward_score import rag_local as rag_2
 # from verl.utils.reward_score import ret
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import re
@@ -16,14 +16,14 @@ import numpy as np
 import threading
 import random
 
-from verl.utils.reward_score.rag_2 import output_sequence
+from verl.utils.reward_score.rag_local import output_sequence
 
 USE_UTILITY_SCORE = True
 USE_GENERATION_SCORE = True
 
 
 def _select_rm_score_fn(data_source):
-        return rag_2.compute_score_rag
+        return rag_2.compute_score_local
 
 
 class RewardManager():

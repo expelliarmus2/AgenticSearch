@@ -368,25 +368,21 @@ def compute_reward_metrics_ppl(batch):
 
 def compute_reward_metrics_rag(batch):
     reward_tensor = batch.batch['token_level_scores'].sum(-1)
+    n = max(reward_tensor.numel(), 1)
 
     reward_metrics = {}
     reward_metrics["reward/mean"] = torch.mean(reward_tensor).detach().item()
-    
-    # Calculate perfect answer ratio (reward == 2)
-    perfect_ratio = torch.sum(reward_tensor == 2).float() / reward_tensor.numel()
-    reward_metrics["reward/utility_1_gen_1"] = perfect_ratio.detach().item()
-    
-    # Calculate partial success ratio (reward == 1)
-    partial_ratio = torch.sum(reward_tensor == 1).float() / reward_tensor.numel()
-    reward_metrics["reward/utility_0_gen_1"] = partial_ratio.detach().item()
-    
-    # Calculate failure ratio (reward == 0)
-    fair_ratio = torch.sum(reward_tensor == 0).float() / reward_tensor.numel()
-    reward_metrics["reward/utility_0_gen_0"] = fair_ratio.detach().item()
-    
-    fair_ratio = torch.sum(reward_tensor == -1).float() / reward_tensor.numel()
-    reward_metrics["reward/utility_-1_gen_0"] = fair_ratio.detach().item()
-    
+
+    # Local rule reward: correct+full protocol = 2.5 (utility 1 + generation 1 +
+    # format 0.5); correct without search = 2.4; tags but wrong answer = 0.5;
+    # no tags at all = 0.1 (forced <query> injection) or 0.
+    correct = torch.sum(reward_tensor >= 2.0).item()
+    formatted = torch.sum((reward_tensor >= 0.5) & (reward_tensor < 2.0)).item()
+    raw = n - correct - formatted
+    reward_metrics["reward/utility_1_gen_1"] = correct / n
+    reward_metrics["reward/utility_0_gen_1"] = formatted / n
+    reward_metrics["reward/utility_0_gen_0"] = raw / n
+    reward_metrics["reward/utility_-1_gen_0"] = 0.0
 
     return reward_metrics
 
@@ -486,7 +482,9 @@ class RayPPOTrainer(object):
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = Role.RefPolicy in role_worker_mapping
+        # memory-constrained setup: skip the ref policy entirely when KL loss is disabled
+        self.use_reference_policy = (Role.RefPolicy in role_worker_mapping
+                                     and self.config.actor_rollout_ref.actor.get('use_kl_loss', True))
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.use_generation_score = use_generation_score
@@ -895,6 +893,9 @@ class RayPPOTrainer(object):
                     ####################
                     # with _timer('step', timing_raw):
                         else:
+                            # s3's LLMGenerationManager generates one trajectory per row;
+                            # repeat the gen batch by rollout.n so GRPO gets n samples per prompt
+                            gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone().long()
 
                             with _timer('gen', timing_raw):
