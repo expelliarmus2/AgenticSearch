@@ -531,6 +531,11 @@ class ActorRolloutRefWorker(Worker):
         if self.rank == 0:
             print(f'Saving actor checkpoint to {local_path}')
             os.makedirs(local_path, exist_ok=True)
+            # 15GB-RAM box: serializing a full fp32 state_dict (+ safetensors buffer)
+            # spikes memory and can hit ENOMEM. Save in fp16 (halves peak); loading
+            # converts back to fp32 anyway (see model-load dtype defaults above).
+            state_dict = {k: (v.half() if v.is_floating_point() else v)
+                          for k, v in state_dict.items()}
             self.actor_module.save_pretrained(local_path, state_dict=state_dict)
             self.tokenizer.save_pretrained(local_path)
             if hdfs_path is not None:

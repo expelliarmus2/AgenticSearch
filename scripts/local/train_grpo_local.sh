@@ -75,7 +75,7 @@ $PYTHON -m verl.trainer.main_ppo \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.total_epochs=1 \
     trainer.total_training_steps=2 \
-    trainer.logger=['console'] \
+    trainer.logger=['console','tensorboard'] \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     +data.random_seed=42 \

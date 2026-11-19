@@ -85,3 +85,29 @@ step:2 - reward/mean:1.300 - reward/utility_1_gen_1:0.250 - pg_loss:-0.047 - gra
 - 检索循环真实触发：`ACTIVE_TRAJ_NUM: [4,4,4,4,4,0]`，每轮 4 条轨迹，valid_search=2
 - checkpoint 正常保存：`verl_checkpoints/<exp>/actor/global_step_{1,2}/`（含 model.safetensors + tokenizer）
 - 单步 ~90-100s（Pascal fp32 + CPU offload）：gen ~30s / update_actor ~35-60s / save ~7s
+
+## 在浏览器看 loss 曲线（TensorBoard）
+
+通用做法有两种：**TensorBoard**（本地离线）和 **wandb**（云端 dashboard）。verl 0.1 原生只支持
+`wandb/mlflow/console`，本机外网不通，所以给 `verl/utils/tracking.py` 加了 `tensorboard` backend（10 行）。
+
+```bash
+# 训练脚本里已配置 trainer.logger=['console','tensorboard']
+bash scripts/local/train_grpo_local.sh
+
+# 另开一个终端起看板（event 文件写在 verl_checkpoints/<实验名>/）
+tensorboard --logdir verl_checkpoints --host 0.0.0.0 --port 6006
+# 浏览器打开 http://localhost:6006   （WSL2 会自动转发到 Windows 宿主）
+```
+
+可看的指标（共 57 个 scalar）：
+- `reward/mean`、`reward/utility_1_gen_1`（答对率）→ 训练是否在变好
+- `actor/pg_loss`、`actor/entropy_loss`、`actor/grad_norm` → 策略更新是否正常
+- `critic/score/*`、`critic/advantages/*` → GRPO 组内奖励分布
+- `env/number_of_valid_search`、`state_tokens/coverage` → 搜索行为与状态掩码
+- `timing_s/gen`、`timing_s/update_actor` → 各阶段耗时
+
+注意：checkpoint 保存改为 **fp16**（`fsdp_workers.save_checkpoint`），否则 15GB 内存下
+`safetensors` 序列化全量 fp32 state_dict 会偶发 `ENOMEM`。加载回训练时仍按 fp32。
+
+wandb 路线（有外网时）：`trainer.logger=['console','wandb']` + `WANDB_API_KEY=...`。

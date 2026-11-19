@@ -22,7 +22,7 @@ from typing import List, Union, Dict, Any
 
 
 class Tracking(object):
-    supported_backend = ['wandb', 'mlflow', 'console']
+    supported_backend = ['wandb', 'mlflow', 'tensorboard', 'console']
 
     def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = 'console', config=None):
         if isinstance(default_backend, str):
@@ -51,6 +51,16 @@ class Tracking(object):
             mlflow.log_params(_compute_mlflow_params_from_objects(config))
             self.logger['mlflow'] = _MlflowLoggingAdapter()
 
+        if 'tensorboard' in default_backend:
+            from torch.utils.tensorboard import SummaryWriter
+            log_dir = None
+            if config is not None:
+                trainer_cfg = config.get('trainer', {})
+                log_dir = trainer_cfg.get('default_local_dir')
+            if log_dir is None:
+                log_dir = f'verl_checkpoints/{project_name}_{experiment_name}'
+            self.logger['tensorboard'] = _TensorboardLoggingAdapter(log_dir=log_dir)
+
         if 'console' in default_backend:
             from verl.utils.logger.aggregate_logger import LocalLogger
             self.console_logger = LocalLogger(print_to_console=True)
@@ -60,6 +70,20 @@ class Tracking(object):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
+
+
+class _TensorboardLoggingAdapter:
+    """Write scalar metrics to a local event file; view with
+    `tensorboard --logdir <log_dir>` in a browser."""
+
+    def __init__(self, log_dir: str):
+        from torch.utils.tensorboard import SummaryWriter
+        self.writer = SummaryWriter(log_dir=log_dir)
+
+    def log(self, data, step):
+        for key, value in data.items():
+            if isinstance(value, (int, float)):
+                self.writer.add_scalar(key, value, global_step=step)
 
 
 class _MlflowLoggingAdapter:
